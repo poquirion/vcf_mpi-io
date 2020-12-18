@@ -53,16 +53,19 @@ class MpiHandle(object):
     def __init__(self, output_file):
         self.open(output_file)
 
-    def Write_at_all(self,offset, data):
-        self.FH.Write_at_all(offset, data)
+    def Write_at(self, offset, data, write_all=True):
+        # if write_all:
+            self.FH.Write_at_all(offset, data)
+        # else:
+        #     self.FH.Write_at(offset, data)
 
     @classmethod
-    def open(cls, output_file):
+    def open(cls, output_file, write_all=True):
         cls.output_file = output_file
         if not cls.FH:
             comm = MPI.COMM_WORLD
             rank = comm.Get_rank()
-            amode = MPI.MODE_WRONLY | MPI.MODE_CREATE
+            amode = MPI.MODE_WRONLY
             logger.info('opening {}'.format(output_file))
             cls.FH = MPI.File.Open(comm, cls.output_file, amode)
             logger.debug('done for {} , rank = {}'.format(output_file, rank))
@@ -70,15 +73,19 @@ class MpiHandle(object):
 
     @classmethod
     def close(cls):
-        logger.info('closing {}'.format(cls.output_file))
-        cls.FH.Close()
-        cls.FH = None
+        if cls.FH is not None:
+            logger.debug('closing {}'.format(cls.output_file))
+            cls.FH.Close()
+            cls.FH = None
+        else:
+            logger.debug('{} already closed'.format(cls.output_file))
+
 
 def exit_handler():
     MpiHandle.close()
 
 
-def serf_write(input_file, output_file, header, offset, buffer_size=None):
+def serf_write(input_file, output_file, header, offset, buffer_size=None, write_all=True):
     """
     Skip the header of input file and write only its data to the output file
     the input file can be large
@@ -102,13 +109,15 @@ def serf_write(input_file, output_file, header, offset, buffer_size=None):
             data = fp.read(buffer_size)
             if not data:
                 break
-            h.Write_at_all(offset, data)
+            h.Write_at(offset, data, write_all=write_all)
             offset = offset + buffer_size
 
     logger.debug('write {}'.format(offset, data, rank))
+    # h.close()
     return input_file
 
-def seigneur(output_file, vcfs):
+
+def seigneur(output_file, vcfs, comm=None, n_workers=1):
     '''
     Concatenated vcf that have all the same header, only works with uncompress vcf for now
     :vcfs: a ordered (in chr and position) list of vcf files
@@ -126,7 +135,7 @@ def seigneur(output_file, vcfs):
     shutil.copyfile(vcfs[0], output_file)
     logger.info('start serf pool')
 
-    with MPIPoolExecutor(max_workers=2) as exe:
+    with MPIPoolExecutor(max_workers=n_workers) as exe:
         offset = os.path.getsize(vcfs[0])
         offsets = [offset]
         for vcf in vcfs[1:-1]:
@@ -134,16 +143,36 @@ def seigneur(output_file, vcfs):
             offsets.append(offset)
 
         logger.debug('map call')
-        results = exe.map(serf_write, vcfs[1:], [output_file for i in offsets], [header for i in offsets], offsets)
-
-        # the loop force waiting for all job to be competed
+        chunks = int((file_num-1)/(n_workers))
+        logger.debug(chunks)
+        logger.debug(file_num-1)
+        # chunks = 1
+        logger.debug('Number of chunks {}'.format(chunks))
+        for i in range(chunks):
+            first = 1 + i*(n_workers)
+            last = first + (n_workers)
+            # last = len(offsets)
+            logger.debug(vcfs[first:last])
+            results = exe.map(serf_write, vcfs[first:last], [output_file for i in offsets[first:last]],
+                              [header for i in offsets[first:last]],
+                              offsets[first:last])
+            for r in results:
+                logger.info('results {}'.format(r))
+            logger.info('Chunk {} written'.format(i+1))
+        # and what is left
+        logger.debug('last vcf {} '.format(last))
+        results = exe.map(serf_write, vcfs[last:], [output_file for i in offsets[last:]],
+                          [header for i in offsets[last:]],
+                          offsets[last:], [False for i in offsets[last:]])
         for r in results:
             logger.info('results {}'.format(r))
+        logger.info('Last Chunk done')
+
 
         return results
 
 
-def main():
+def main(comm=None):
 
     parser = argparse.ArgumentParser(description="Concatenate vcf files that have the same header".format(
         file=os.path.basename(
@@ -151,26 +180,31 @@ def main():
 
     parser.add_argument('--file', '-f', nargs='+')
     parser.add_argument('--output', '-o', default='concateated.vcf', required=False)
+    parser.add_argument('--n_workers', '-n', default=1, type=int, required=False, help='Number of worker for the ' \
+                                                                                      'process')
 
     parsed = parser.parse_args()
     output = parsed.output
+    n_workers = parsed.n_workers
+
     in_vcfs_files = parsed.file
+
     vcfs = []
     for in_file in in_vcfs_files:
         vcfs += [line.strip() for line in open(in_file, 'r')]
 
-    seigneur(output_file=output, vcfs=vcfs)
+    seigneur(output_file=output, vcfs=vcfs, comm=comm, n_workers=n_workers)
 
 
 if __name__ == '__worker__':
     comm = MPI.COMM_WORLD
     logger = logging.getLogger("Serf_{1}_{0}".format(__file__, comm.rank))
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.DEBUG)
     logger.info('Start'.format(comm.rank))
 
 
 if __name__ == '__main__':
     comm = MPI.COMM_WORLD
     logger = logging.getLogger("Seigneur {}".format(__file__))
-    logging.basicConfig(level=logging.INFO)
-    main()
+    logging.basicConfig(level=logging.DEBUG)
+    main(comm)
